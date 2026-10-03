@@ -1,0 +1,7 @@
+{
+  "name": "GhostChat - Full Anonymous Real-time Chat",
+  "description": "Obrolan anonim real-time tanpa login, tanpa database, tanpa jejak identitas. Ngobrol 1-on-1 acak atau masuk ke temporary burner rooms secara aman dan privat.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
