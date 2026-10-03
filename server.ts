@@ -317,6 +317,18 @@ async function startServer() {
   const server = createServer(app);
   const PORT = Number(process.env.PORT) || 3000;
 
+  // Enable CORS for cross-origin requests (e.g. from GitHub Pages to Render)
+  app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(204);
+      return;
+    }
+    next();
+  });
+
   const wss = new WebSocketServer({ noServer: true });
   setupWebSocket(wss);
 

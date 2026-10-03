@@ -1,52 +1,49 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import mqtt, { MqttClient } from 'mqtt';
 import { ChatMessage } from '../types';
 import { sound } from '../utils/sound';
 
-function getWsEndpoint(userId: string): string {
-  const envUrl = (import.meta as any).env?.VITE_SERVER_URL || (import.meta as any).env?.VITE_WS_URL;
-  const custom = typeof window !== 'undefined' ? localStorage.getItem('anon_chat_server') : null;
-  const target = custom || envUrl;
+const MQTT_TOPIC_ROOM = 'ghostchat/v1/global_room';
+const MQTT_TOPIC_PRESENCE = 'ghostchat/v1/presence';
+const MQTT_BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+];
 
-  if (target) {
-    try {
-      const url = new URL(target.startsWith('http') || target.startsWith('ws') ? target : `https://${target}`);
-      const proto = url.protocol === 'https:' || url.protocol === 'wss:' ? 'wss:' : 'ws:';
-      const q = userId ? `?userId=${encodeURIComponent(userId)}` : '';
-      return `${proto}//${url.host}/ws${q}`;
-    } catch {}
-  }
-
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const query = userId ? `?userId=${encodeURIComponent(userId)}` : '';
-  return `${protocol}//${window.location.host}/ws${query}`;
+function isGitHubPages(): boolean {
+  if (typeof window === 'undefined') return false;
+  return window.location.hostname.endsWith('github.io') || window.location.hostname.includes('github.dev');
 }
 
-function getHttpApiBase(): string {
-  const envUrl = (import.meta as any).env?.VITE_SERVER_URL;
-  const custom = typeof window !== 'undefined' ? localStorage.getItem('anon_chat_server') : null;
-  const target = custom || envUrl;
-  if (target) {
-    try {
-      const url = new URL(target.startsWith('http') ? target : `https://${target}`);
-      return `${url.protocol}//${url.host}`;
-    } catch {}
-  }
-  return '';
+function getLocalHistory(): ChatMessage[] {
+  try {
+    const raw = localStorage.getItem('ghost_chat_history');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.slice(-50);
+    }
+  } catch {}
+  return [];
+}
+
+function saveLocalHistory(msgs: ChatMessage[]) {
+  try {
+    localStorage.setItem('ghost_chat_history', JSON.stringify(msgs.slice(-50)));
+  } catch {}
 }
 
 export function useGhostSocket() {
   const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<number | null>(null);
-  const pingIntervalRef = useRef<number | null>(null);
-  const pollIntervalRef = useRef<number | null>(null);
-  const typingTimerRef = useRef<number | null>(null);
+  const mqttClientRef = useRef<MqttClient | null>(null);
   const isMountedRef = useRef<boolean>(true);
   const isClosingIntentionally = useRef<boolean>(false);
-  const localChannelRef = useRef<BroadcastChannel | null>(null);
+  const presenceIntervalRef = useRef<number | null>(null);
+  const activePeersRef = useRef<Map<string, number>>(new Map());
+  const typingTimerRef = useRef<number | null>(null);
 
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
-  
-  // Persist session userId in sessionStorage so page reload re-uses the exact same identity
+
+  // Persist session userId in sessionStorage
   const [userId, setUserId] = useState<string>(() => {
     try {
       const saved = sessionStorage.getItem('anon_chat_uid');
@@ -61,173 +58,204 @@ export function useGhostSocket() {
   const userIdRef = useRef<string>(userId);
   userIdRef.current = userId;
 
-  const [alias, setAlias] = useState<string>('');
+  const [alias, setAlias] = useState<string>(() => {
+    try {
+      const saved = sessionStorage.getItem('anon_chat_alias');
+      if (saved) return saved;
+      const adjectives = ['Misterius', 'Hantu', 'Bayangan', 'Angin', 'Senja', 'Bintang', 'Kilat', 'Samudra'];
+      const nouns = ['Cepat', 'Tenang', 'Kelana', 'Malam', 'Abadi', 'Sunyi', 'Hebat', 'Samar'];
+      const gen = adjectives[Math.floor(Math.random() * adjectives.length)] + ' ' + nouns[Math.floor(Math.random() * nouns.length)];
+      sessionStorage.setItem('anon_chat_alias', gen);
+      return gen;
+    } catch {
+      return 'Anonim';
+    }
+  });
+  const aliasRef = useRef<string>(alias);
+  aliasRef.current = alias;
+
   const [avatar, setAvatar] = useState<string>(() => {
     try {
-      return sessionStorage.getItem('anon_chat_avatar') || '0';
+      const saved = sessionStorage.getItem('anon_chat_avatar');
+      if (saved) return saved;
+      const av = String(Math.floor(Math.random() * 8));
+      sessionStorage.setItem('anon_chat_avatar', av);
+      return av;
     } catch {
       return '0';
     }
   });
+  const avatarRef = useRef<string>(avatar);
+  avatarRef.current = avatar;
+
   const [onlineCount, setOnlineCount] = useState<number>(1);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => getLocalHistory());
   const [typingAvatars, setTypingAvatars] = useState<string[]>([]);
 
-  const isHttpFallback = useRef<boolean>(false);
-
-  // Dispatch events from WebSocket, HTTP polling, or local BroadcastChannel
-  const handleServerEvent = useCallback((data: any) => {
-    switch (data.type) {
-      case 'connection:init':
-        setUserId(data.userId);
-        userIdRef.current = data.userId;
-        try {
-          sessionStorage.setItem('anon_chat_uid', data.userId);
-        } catch {}
-
-        setAlias(data.alias);
-        if (data.avatar) {
-          setAvatar(data.avatar);
-          try {
-            sessionStorage.setItem('anon_chat_avatar', data.avatar);
-          } catch {}
-        }
-        setOnlineCount(data.onlineCount || 1);
-        if (Array.isArray(data.recentMessages)) {
-          setMessages(
-            data.recentMessages.map((m: ChatMessage) => ({
-              ...m,
-              isSelf: m.senderId === data.userId,
-            }))
-          );
-        }
-        break;
-
-      case 'server:online_count':
-        if (typeof data.onlineCount === 'number') {
-          setOnlineCount(data.onlineCount);
-        }
-        break;
-
-      case 'identity:updated':
-        if (data.avatar) {
-          setAvatar(data.avatar);
-          try {
-            sessionStorage.setItem('anon_chat_avatar', data.avatar);
-          } catch {}
-        }
-        break;
-
-      case 'chat:new_message': {
-        const msg: ChatMessage = data.message;
-        const isSelf = msg.senderId === userIdRef.current;
-        if (!isSelf && msg.msgType !== 'system') {
-          sound.playMessageReceived();
-        }
-        setMessages(prev => {
-          if (prev.some(m => m.id === msg.id)) return prev;
-          return [...prev, { ...msg, isSelf }];
-        });
-        break;
-      }
-
-      case 'chat:typing_update': {
-        const others = (data.typingUsers || [])
-          .filter((u: { userId: string; avatar: string }) => u.userId !== userIdRef.current)
-          .map((u: { userId: string; avatar: string }) => u.avatar);
-        setTypingAvatars(others);
-        break;
-      }
-
-      case 'chat:message_reaction': {
-        setMessages(prev =>
-          prev.map(m => {
-            if (m.id === data.messageId) {
-              return { ...m, reactions: data.reactions };
-            }
-            return m;
-          })
-        );
-        break;
-      }
-    }
+  // Update messages and persist to local storage
+  const appendMessage = useCallback((msg: ChatMessage) => {
+    setMessages(prev => {
+      if (prev.some(m => m.id === msg.id)) return prev;
+      const next = [...prev, msg];
+      saveLocalHistory(next);
+      return next;
+    });
   }, []);
 
-  // Cross-tab broadcast for static deployments or offline sync
-  useEffect(() => {
-    try {
-      if ('BroadcastChannel' in window) {
-        const bc = new BroadcastChannel('anon_chat_mesh');
-        localChannelRef.current = bc;
-        bc.onmessage = (event) => {
-          if (event.data) {
-            handleServerEvent(event.data);
+  // Update message reaction
+  const applyReaction = useCallback((messageId: string, emoji: string, senderId: string) => {
+    setMessages(prev => {
+      const next = prev.map(m => {
+        if (m.id === messageId) {
+          const reactions = { ...(m.reactions || {}) };
+          const users = reactions[emoji] || [];
+          if (users.includes(senderId)) {
+            reactions[emoji] = users.filter(u => u !== senderId);
+            if (reactions[emoji].length === 0) delete reactions[emoji];
+          } else {
+            reactions[emoji] = [...users, senderId];
           }
-        };
-      }
-    } catch {}
-    return () => {
-      try {
-        localChannelRef.current?.close();
-      } catch {}
-    };
-  }, [handleServerEvent]);
-
-  // HTTP polling fallback if needed
-  const startHttpFallback = useCallback(async () => {
-    if (isHttpFallback.current) return;
-    isHttpFallback.current = true;
-
-    const apiBase = getHttpApiBase();
-
-    try {
-      const initRes = await fetch(`${apiBase}/api/init`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: userIdRef.current || undefined }),
-      });
-      if (initRes.ok) {
-        const initData = await initRes.json();
-        setConnectionStatus('connected');
-        handleServerEvent({
-          type: 'connection:init',
-          ...initData,
-        });
-      }
-    } catch {}
-
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    pollIntervalRef.current = window.setInterval(async () => {
-      if (!isMountedRef.current || !isHttpFallback.current) return;
-      if (!userIdRef.current) return;
-
-      try {
-        const res = await fetch(`${apiBase}/api/poll?userId=${encodeURIComponent(userIdRef.current)}`);
-        if (res.ok) {
-          const pollData = await res.json();
-          if (Array.isArray(pollData.events)) {
-            for (const ev of pollData.events) {
-              handleServerEvent(ev);
-            }
-          }
+          return { ...m, reactions };
         }
-      } catch {}
-    }, 1200);
-  }, [handleServerEvent]);
+        return m;
+      });
+      saveLocalHistory(next);
+      return next;
+    });
+  }, []);
 
-  // Connect via WebSocket
-  const connect = useCallback(() => {
+  // Connect via Serverless Public MQTT Relay (works 100% on GitHub Pages with ZERO backend needed)
+  const connectServerlessMqtt = useCallback(() => {
     if (!isMountedRef.current) return;
-
-    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
-      return;
-    }
+    if (mqttClientRef.current) return;
 
     setConnectionStatus('connecting');
-    const wsUrl = getWsEndpoint(userIdRef.current);
 
     try {
-      isClosingIntentionally.current = false;
+      const brokerUrl = MQTT_BROKERS[0];
+      const client = mqtt.connect(brokerUrl, {
+        clientId: 'ghost_' + userIdRef.current + '_' + Math.random().toString(16).substring(2, 8),
+        keepalive: 30,
+        reconnectPeriod: 4000,
+        clean: true,
+      });
+
+      mqttClientRef.current = client;
+
+      client.on('connect', () => {
+        if (!isMountedRef.current) return;
+        setConnectionStatus('connected');
+
+        client.subscribe([MQTT_TOPIC_ROOM, MQTT_TOPIC_PRESENCE], (err) => {
+          if (err) console.error('MQTT subscribe error:', err);
+        });
+
+        // Send initial presence announcement
+        const announcePresence = () => {
+          if (client.connected) {
+            client.publish(
+              MQTT_TOPIC_PRESENCE,
+              JSON.stringify({
+                userId: userIdRef.current,
+                alias: aliasRef.current,
+                avatar: avatarRef.current,
+                timestamp: Date.now(),
+              })
+            );
+          }
+        };
+
+        announcePresence();
+
+        if (presenceIntervalRef.current) clearInterval(presenceIntervalRef.current);
+        presenceIntervalRef.current = window.setInterval(() => {
+          announcePresence();
+
+          // Prune stale peers older than 25 seconds
+          const now = Date.now();
+          activePeersRef.current.forEach((time, peerId) => {
+            if (now - time > 25000) {
+              activePeersRef.current.delete(peerId);
+            }
+          });
+          setOnlineCount(Math.max(1, activePeersRef.current.size + 1));
+        }, 8000);
+      });
+
+      client.on('message', (topic, payload) => {
+        try {
+          const data = JSON.parse(payload.toString());
+
+          if (topic === MQTT_TOPIC_PRESENCE) {
+            if (data.userId && data.userId !== userIdRef.current) {
+              activePeersRef.current.set(data.userId, Date.now());
+              setOnlineCount(Math.max(1, activePeersRef.current.size + 1));
+            }
+            return;
+          }
+
+          if (topic === MQTT_TOPIC_ROOM) {
+            if (data.type === 'chat:message') {
+              const msg: ChatMessage = data.message;
+              const isSelf = msg.senderId === userIdRef.current;
+              if (!isSelf && msg.msgType !== 'system') {
+                sound.playMessageReceived();
+              }
+              appendMessage({ ...msg, isSelf });
+            } else if (data.type === 'chat:typing') {
+              if (data.userId !== userIdRef.current) {
+                if (data.isTyping) {
+                  setTypingAvatars(prev => Array.from(new Set([...prev, data.avatar])));
+                } else {
+                  setTypingAvatars(prev => prev.filter(a => a !== data.avatar));
+                }
+              }
+            } else if (data.type === 'chat:reaction') {
+              applyReaction(data.messageId, data.emoji, data.senderId);
+            }
+          }
+        } catch (err) {
+          console.error('MQTT message error:', err);
+        }
+      });
+
+      client.on('offline', () => {
+        if (isMountedRef.current && !isClosingIntentionally.current) {
+          setConnectionStatus('disconnected');
+        }
+      });
+
+      client.on('error', (err) => {
+        console.warn('MQTT connection notice:', err);
+      });
+    } catch (err) {
+      console.error('Failed to init MQTT:', err);
+      setConnectionStatus('disconnected');
+    }
+  }, [appendMessage, applyReaction]);
+
+  // Connect via Node.js WebSocket (if local or custom backend is present)
+  const connectNodeWs = useCallback(() => {
+    if (!isMountedRef.current) return;
+    setConnectionStatus('connecting');
+
+    const envUrl = (import.meta as any).env?.VITE_SERVER_URL;
+    let wsUrl: string;
+
+    if (envUrl) {
+      try {
+        const u = new URL(envUrl);
+        const proto = u.protocol === 'https:' ? 'wss:' : 'ws:';
+        wsUrl = `${proto}//${u.host}/ws?userId=${encodeURIComponent(userIdRef.current)}`;
+      } catch {
+        wsUrl = `wss://${envUrl}/ws?userId=${encodeURIComponent(userIdRef.current)}`;
+      }
+    } else {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      wsUrl = `${proto}//${window.location.host}/ws?userId=${encodeURIComponent(userIdRef.current)}`;
+    }
+
+    try {
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -237,104 +265,87 @@ export function useGhostSocket() {
           return;
         }
         setConnectionStatus('connected');
-        isHttpFallback.current = false;
-        if (pollIntervalRef.current) {
-          clearInterval(pollIntervalRef.current);
-          pollIntervalRef.current = null;
-        }
-
-        if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-        pingIntervalRef.current = window.setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping' }));
-          }
-        }, 25000);
       };
 
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          handleServerEvent(data);
-        } catch (err) {
-          console.error('Failed to parse socket message:', err);
-        }
+          if (data.type === 'connection:init') {
+            setAlias(data.alias);
+            aliasRef.current = data.alias;
+            if (data.avatar) {
+              setAvatar(data.avatar);
+              avatarRef.current = data.avatar;
+            }
+            setOnlineCount(data.onlineCount || 1);
+            if (Array.isArray(data.recentMessages) && data.recentMessages.length > 0) {
+              setMessages(
+                data.recentMessages.map((m: ChatMessage) => ({
+                  ...m,
+                  isSelf: m.senderId === userIdRef.current,
+                }))
+              );
+            }
+          } else if (data.type === 'server:online_count') {
+            setOnlineCount(data.onlineCount);
+          } else if (data.type === 'chat:new_message') {
+            const msg: ChatMessage = data.message;
+            const isSelf = msg.senderId === userIdRef.current;
+            if (!isSelf && msg.msgType !== 'system') {
+              sound.playMessageReceived();
+            }
+            appendMessage({ ...msg, isSelf });
+          } else if (data.type === 'chat:typing_update') {
+            const others = (data.typingUsers || [])
+              .filter((u: { userId: string; avatar: string }) => u.userId !== userIdRef.current)
+              .map((u: { userId: string; avatar: string }) => u.avatar);
+            setTypingAvatars(others);
+          } else if (data.type === 'chat:message_reaction') {
+            setMessages(prev =>
+              prev.map(m => (m.id === data.messageId ? { ...m, reactions: data.reactions } : m))
+            );
+          }
+        } catch {}
       };
 
       ws.onclose = () => {
         if (!isMountedRef.current || isClosingIntentionally.current) return;
-        setConnectionStatus('disconnected');
-        if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-
-        startHttpFallback();
-
-        reconnectTimeoutRef.current = window.setTimeout(() => {
-          if (isMountedRef.current) {
-            connect();
-          }
-        }, 3000);
+        // If local websocket closes or is unavailable, seamlessly switch to Serverless MQTT
+        connectServerlessMqtt();
       };
 
       ws.onerror = () => {
-        if (!isClosingIntentionally.current) {
-          startHttpFallback();
-        }
+        // Fallback to Serverless MQTT immediately
+        connectServerlessMqtt();
       };
     } catch {
-      startHttpFallback();
+      connectServerlessMqtt();
     }
-  }, [handleServerEvent, startHttpFallback]);
+  }, [appendMessage, connectServerlessMqtt]);
 
   useEffect(() => {
     isMountedRef.current = true;
-    connect();
+    isClosingIntentionally.current = false;
+
+    // If on GitHub Pages without a custom backend, directly use serverless MQTT for instantaneous connection
+    const customUrl = (import.meta as any).env?.VITE_SERVER_URL;
+    if (isGitHubPages() && !customUrl) {
+      connectServerlessMqtt();
+    } else {
+      connectNodeWs();
+    }
 
     return () => {
       isMountedRef.current = false;
       isClosingIntentionally.current = true;
-      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      if (presenceIntervalRef.current) clearInterval(presenceIntervalRef.current);
+      if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+      if (wsRef.current) wsRef.current.close();
+      if (mqttClientRef.current) mqttClientRef.current.end();
     };
-  }, [connect]);
+  }, [connectNodeWs, connectServerlessMqtt]);
 
-  // Send action via WebSocket, HTTP fallback, or local broadcast
-  const sendAction = useCallback((data: any) => {
-    // If local channel exists, broadcast to local tabs
-    try {
-      localChannelRef.current?.postMessage(data);
-    } catch {}
-
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data));
-      return;
-    }
-    const apiBase = getHttpApiBase();
-    if (userIdRef.current && apiBase) {
-      fetch(`${apiBase}/api/action`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: userIdRef.current,
-          data,
-        }),
-      }).catch(() => {});
-    }
-  }, []);
-
-  const updateAvatar = useCallback((newAvatar: string) => {
-    setAvatar(newAvatar);
-    try {
-      sessionStorage.setItem('anon_chat_avatar', newAvatar);
-    } catch {}
-    sendAction({
-      type: 'identity:update',
-      avatar: newAvatar,
-    });
-  }, [sendAction]);
-
+  // Send message
   const sendMessage = useCallback((
     text: string,
     options?: {
@@ -347,10 +358,10 @@ export function useGhostSocket() {
 
     sound.playMessageSent();
     const newMsg: ChatMessage = {
-      id: 'msg_' + Math.random().toString(36).substring(2, 9),
+      id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
       senderId: userIdRef.current,
-      senderAlias: alias || 'Anonim',
-      senderAvatar: avatar,
+      senderAlias: aliasRef.current,
+      senderAvatar: avatarRef.current,
       text: text.trim(),
       msgType: options?.msgType || 'text',
       mediaUrl: options?.mediaUrl,
@@ -359,43 +370,112 @@ export function useGhostSocket() {
       reactions: {},
     };
 
-    // If offline/disconnected, show message immediately on self
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      setMessages(prev => [...prev, { ...newMsg, isSelf: true }]);
+    // Show self immediately
+    appendMessage({ ...newMsg, isSelf: true });
+
+    // Send through WebSocket if active
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'chat:message',
+          text: text.trim(),
+          msgType: options?.msgType || 'text',
+          mediaUrl: options?.mediaUrl,
+          duration: options?.duration,
+        })
+      );
+      return;
     }
 
-    sendAction({
-      type: 'chat:message',
-      text: text.trim(),
-      msgType: options?.msgType || 'text',
-      mediaUrl: options?.mediaUrl,
-      duration: options?.duration,
-    });
-  }, [sendAction, alias, avatar]);
+    // Otherwise send through Serverless MQTT
+    if (mqttClientRef.current && mqttClientRef.current.connected) {
+      mqttClientRef.current.publish(
+        MQTT_TOPIC_ROOM,
+        JSON.stringify({
+          type: 'chat:message',
+          message: newMsg,
+        })
+      );
+    }
+  }, [appendMessage]);
 
-  const sendTyping = useCallback((isTyping: boolean) => {
-    sendAction({
-      type: 'chat:typing',
-      isTyping,
-    });
-  }, [sendAction]);
+  // Update avatar
+  const updateAvatar = useCallback((newAvatar: string) => {
+    setAvatar(newAvatar);
+    avatarRef.current = newAvatar;
+    try {
+      sessionStorage.setItem('anon_chat_avatar', newAvatar);
+    } catch {}
 
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'identity:update',
+          avatar: newAvatar,
+        })
+      );
+    }
+  }, []);
+
+  // Send typing status
   const triggerTyping = useCallback(() => {
-    sendTyping(true);
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'chat:typing', isTyping: true }));
+    } else if (mqttClientRef.current && mqttClientRef.current.connected) {
+      mqttClientRef.current.publish(
+        MQTT_TOPIC_ROOM,
+        JSON.stringify({
+          type: 'chat:typing',
+          userId: userIdRef.current,
+          avatar: avatarRef.current,
+          isTyping: true,
+        })
+      );
+    }
+
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
     typingTimerRef.current = window.setTimeout(() => {
-      sendTyping(false);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'chat:typing', isTyping: false }));
+      } else if (mqttClientRef.current && mqttClientRef.current.connected) {
+        mqttClientRef.current.publish(
+          MQTT_TOPIC_ROOM,
+          JSON.stringify({
+            type: 'chat:typing',
+            userId: userIdRef.current,
+            avatar: avatarRef.current,
+            isTyping: false,
+          })
+        );
+      }
     }, 1800);
-  }, [sendTyping]);
+  }, []);
 
+  // Send reaction
   const sendReaction = useCallback((messageId: string, emoji: string) => {
     sound.playClick();
-    sendAction({
-      type: 'chat:reaction',
-      messageId,
-      emoji,
-    });
-  }, [sendAction]);
+    applyReaction(messageId, emoji, userIdRef.current);
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'chat:reaction',
+          messageId,
+          emoji,
+        })
+      );
+    } else if (mqttClientRef.current && mqttClientRef.current.connected) {
+      mqttClientRef.current.publish(
+        MQTT_TOPIC_ROOM,
+        JSON.stringify({
+          type: 'chat:reaction',
+          messageId,
+          emoji,
+          senderId: userIdRef.current,
+        })
+      );
+    }
+  }, [applyReaction]);
 
   return {
     connectionStatus,
