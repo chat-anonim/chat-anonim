@@ -5,13 +5,11 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
-# Hak akses yang diperlukan untuk mempublikasikan web ke GitHub Pages
 permissions:
   contents: read
   pages: write
   id-token: write
 
-# Menghindari penumpukan deploy bersamaan
 concurrency:
   group: "pages"
   cancel-in-progress: false
@@ -30,10 +28,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
 
       - name: Install Dependencies
-        run: npm ci
+        run: npm install --legacy-peer-deps
 
       - name: Build Web Application
         run: npm run build
@@ -41,7 +38,7 @@ jobs:
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v5
 
-      - name: Upload Artifact Hasil Build (dist)
+      - name: Upload Artifact Hasil Build
         uses: actions/upload-pages-artifact@v3
         with:
           path: './dist'
@@ -49,12 +46,3 @@ jobs:
       - name: Deploy ke GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
-      - name: Trigger Cloud Server Deploy (Opsional)
-        # Jika kamu juga memasang backend di Render dan mengisi RENDER_DEPLOY_HOOK di GitHub Secrets
-        if: env.RENDER_HOOK != ''
-        env:
-          RENDER_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
-        run: |
-          curl -X POST "$RENDER_HOOK"
-          echo "Deploy hook server berhasil dikirim!"
