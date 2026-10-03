@@ -195,6 +195,30 @@ function handleClientAction(client: ClientUser, data: any) {
       break;
     }
 
+    case 'chat:delete_message': {
+      if (data.adminKey === 'Farabi24' && data.messageId) {
+        const idx = recentMessages.findIndex(m => m.id === data.messageId);
+        if (idx !== -1) {
+          recentMessages.splice(idx, 1);
+        }
+        broadcastToAll({
+          type: 'chat:delete_message',
+          messageId: data.messageId,
+        });
+      }
+      break;
+    }
+
+    case 'chat:clear_all': {
+      if (data.adminKey === 'Farabi24') {
+        recentMessages.length = 0;
+        broadcastToAll({
+          type: 'chat:clear_all',
+        });
+      }
+      break;
+    }
+
     case 'ping': {
       sendToClient(client, { type: 'pong' });
       break;

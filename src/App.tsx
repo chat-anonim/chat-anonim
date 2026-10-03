@@ -7,6 +7,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useGhostSocket } from './hooks/useGhostSocket';
 import { AudioRecorder } from './components/AudioRecorder';
 import { IdentityModal, AVATAR_PALETTES } from './components/IdentityModal';
+import { AdminModal } from './components/AdminModal';
 import {
   Send,
   Mic,
@@ -16,6 +17,10 @@ import {
   Eye,
   EyeOff,
   WifiOff,
+  Shield,
+  Trash2,
+  Smartphone,
+  Monitor,
 } from 'lucide-react';
 
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '🔥', '🤐'];
@@ -26,10 +31,13 @@ export default function App() {
     userId,
     avatar,
     onlineCount,
+    activePeers,
     messages,
     typingAvatars,
     updateAvatar,
     sendMessage,
+    deleteMessage,
+    clearAllMessages,
     triggerTyping,
     sendReaction,
   } = useGhostSocket();
@@ -38,7 +46,17 @@ export default function App() {
   const [showRecorder, setShowRecorder] = useState(false);
   const [revealedImages, setRevealedImages] = useState<Record<string, boolean>>({});
   const [isColorModalOpen, setIsColorModalOpen] = useState(false);
+  const [isAdminModalOpen, setIsAdminModalOpen] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+
+  // Admin state (persisted per session)
+  const [isAdmin, setIsAdmin] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem('ghost_admin_authed') === 'true';
+    } catch {
+      return false;
+    }
+  });
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -46,6 +64,21 @@ export default function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typingAvatars]);
+
+  const handleAdminLoginSuccess = () => {
+    setIsAdmin(true);
+    try {
+      sessionStorage.setItem('ghost_admin_authed', 'true');
+    } catch {}
+  };
+
+  const handleAdminLogout = () => {
+    setIsAdmin(false);
+    try {
+      sessionStorage.removeItem('ghost_admin_authed');
+    } catch {}
+    setIsAdminModalOpen(false);
+  };
 
   const handleSend = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -146,7 +179,21 @@ export default function App() {
         </div>
       )}
 
-      {/* Header: Online count on left, Share & Color Profile Avatar on right */}
+      {/* Admin banner notice when Farabi is logged in */}
+      {isAdmin && (
+        <div className="w-full bg-amber-500 text-white px-4 py-1 text-center text-xs font-medium flex items-center justify-center gap-2 shadow-xs shrink-0 z-30">
+          <Shield className="w-3.5 h-3.5" />
+          <span>Mode Admin Aktif (Farabi) • Kamu bisa menghapus chat siapa pun dan melihat perangkat</span>
+          <button
+            onClick={() => setIsAdminModalOpen(true)}
+            className="underline ml-2 hover:text-amber-100 font-semibold cursor-pointer"
+          >
+            Buka Panel
+          </button>
+        </div>
+      )}
+
+      {/* Header: Online count on left, Admin Button, Share & Color Profile Avatar on right */}
       <header className="px-4 py-2.5 border-b border-slate-200 bg-white/90 backdrop-blur-md flex items-center justify-between shrink-0 z-20">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
@@ -155,7 +202,21 @@ export default function App() {
           </span>
         </div>
 
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2">
+          {/* Admin Button */}
+          <button
+            onClick={() => setIsAdminModalOpen(true)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium transition-all cursor-pointer ${
+              isAdmin
+                ? 'bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300 font-bold shadow-xs'
+                : 'bg-slate-100 hover:bg-slate-200 text-slate-600'
+            }`}
+            title={isAdmin ? 'Panel Admin Farabi' : 'Masuk Admin'}
+          >
+            <Shield className={`w-3.5 h-3.5 ${isAdmin ? 'text-amber-600' : 'text-slate-500'}`} />
+            <span>{isAdmin ? '👑 Admin' : 'Admin'}</span>
+          </button>
+
           {/* Share Link button */}
           <button
             onClick={handleCopyLink}
@@ -219,7 +280,7 @@ export default function App() {
               <div className={`flex flex-col ${isSelf ? 'items-end' : 'items-start'} max-w-[82%] md:max-w-[70%]`}>
                 {/* Bubble */}
                 <div
-                  className={`rounded-2xl p-3 text-sm transition-all ${
+                  className={`rounded-2xl p-3 text-sm transition-all relative ${
                     isSelf
                       ? 'bg-emerald-600 text-white rounded-br-xs shadow-xs'
                       : 'bg-white text-slate-800 border border-slate-200 rounded-bl-xs shadow-xs'
@@ -295,9 +356,45 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Timestamp below bubble */}
-                <div className="px-1 mt-1 text-[10px] text-slate-400 font-mono">
-                  {formatTimestamp(msg.timestamp)}
+                {/* Sub-info below bubble: Timestamp, Device Used, and Admin Delete button */}
+                <div className="flex items-center gap-2 px-1 mt-1 flex-wrap">
+                  {/* Timestamp */}
+                  <span className="text-[10px] text-slate-400 font-mono">
+                    {formatTimestamp(msg.timestamp)}
+                  </span>
+
+                  {/* Device Used Badge */}
+                  {msg.deviceInfo && (
+                    <span
+                      className={`text-[10px] flex items-center gap-1 font-mono px-1.5 py-0.2 rounded-md ${
+                        isAdmin
+                          ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                          : 'bg-slate-100 text-slate-500'
+                      }`}
+                      title={`Dikirim dari: ${msg.deviceInfo.full}`}
+                    >
+                      {msg.deviceInfo.isMobile ? (
+                        <Smartphone className="w-2.5 h-2.5" />
+                      ) : (
+                        <Monitor className="w-2.5 h-2.5" />
+                      )}
+                      <span>{msg.deviceInfo.device}</span>
+                      <span className="opacity-60">•</span>
+                      <span>{msg.deviceInfo.browser}</span>
+                    </span>
+                  )}
+
+                  {/* Admin Delete Action Button (Can delete ANY message) */}
+                  {isAdmin && (
+                    <button
+                      onClick={() => deleteMessage(msg.id)}
+                      className="flex items-center gap-1 text-[10px] font-semibold text-rose-600 hover:text-rose-700 bg-rose-50 hover:bg-rose-100 px-1.5 py-0.5 rounded-md border border-rose-200 transition-colors cursor-pointer"
+                      title="Hapus pesan ini sebagai Admin"
+                    >
+                      <Trash2 className="w-2.5 h-2.5 text-rose-600" />
+                      <span>Hapus Chat</span>
+                    </button>
+                  )}
                 </div>
 
                 {/* Quick emoji on hover */}
@@ -328,20 +425,20 @@ export default function App() {
 
         {/* Live typing status with color dots */}
         {typingAvatars.length > 0 && (
-          <div className="flex items-center gap-2 pl-1">
-            {typingAvatars.map((colorId, idx) => {
-              const pal = AVATAR_PALETTES.find(p => p.id === colorId) || AVATAR_PALETTES[0];
-              return (
-                <div key={idx} className="flex items-center gap-1.5 bg-white border border-slate-200 rounded-2xl px-3 py-1.5 shadow-xs">
-                  <div className={`w-3.5 h-3.5 rounded-full ${pal.bg}`} />
-                  <div className="flex items-center gap-1">
-                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce [animation-delay:0ms]" />
-                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce [animation-delay:150ms]" />
-                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce [animation-delay:300ms]" />
-                  </div>
-                </div>
-              );
-            })}
+          <div className="flex items-center gap-2 text-slate-400 text-xs">
+            <div className="flex -space-x-1.5">
+              {typingAvatars.map((av, idx) => {
+                const pal = AVATAR_PALETTES.find(p => p.id === av) || AVATAR_PALETTES[0];
+                return (
+                  <div
+                    key={idx}
+                    className={`w-4 h-4 rounded-full ${pal.bg} ring-2 ring-white shadow-2xs animate-bounce`}
+                    style={{ animationDelay: `${idx * 150}ms` }}
+                  />
+                );
+              })}
+            </div>
+            <span className="font-mono text-[11px] text-slate-400">sedang mengetik...</span>
           </div>
         )}
 
@@ -349,69 +446,89 @@ export default function App() {
       </div>
 
       {/* Input bar */}
-      <div className="p-3 border-t border-slate-200 bg-white shrink-0">
-        {showRecorder ? (
-          <AudioRecorder
-            onSendAudio={handleAudioComplete}
-            onCancel={() => setShowRecorder(false)}
+      <footer className="p-3 border-t border-slate-200 bg-white shrink-0">
+        <form onSubmit={handleSend} className="max-w-4xl mx-auto flex items-center gap-2">
+          {/* File upload hidden input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={handleImageUpload}
           />
-        ) : (
-          <form onSubmit={handleSend} className="flex items-center gap-2">
-            <input
-              type="file"
-              ref={fileInputRef}
-              onChange={handleImageUpload}
-              accept="image/*"
-              className="hidden"
-            />
 
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="p-2.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer shrink-0"
-              title="Kirim Foto"
-            >
-              <ImageIcon className="w-4 h-4" />
-            </button>
+          {/* Picture button */}
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="p-2.5 rounded-full hover:bg-slate-100 text-slate-600 transition-colors cursor-pointer shrink-0"
+            title="Kirim Foto"
+          >
+            <ImageIcon className="w-5 h-5" />
+          </button>
 
-            <button
-              type="button"
-              onClick={() => setShowRecorder(true)}
-              className="p-2.5 text-slate-500 hover:text-emerald-600 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer shrink-0"
-              title="Kirim Pesan Suara"
-            >
-              <Mic className="w-4 h-4" />
-            </button>
+          {/* Voice note button */}
+          <button
+            type="button"
+            onClick={() => setShowRecorder(true)}
+            className="p-2.5 rounded-full hover:bg-slate-100 text-slate-600 transition-colors cursor-pointer shrink-0"
+            title="Kirim Pesan Suara"
+          >
+            <Mic className="w-5 h-5" />
+          </button>
 
-            <input
-              type="text"
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Ketik pesan..."
-              maxLength={2000}
-              autoFocus
-              className="flex-1 bg-slate-100 border border-slate-200 focus:border-slate-300 focus:bg-white rounded-xl px-4 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none transition-colors"
-            />
+          {/* Text input */}
+          <input
+            type="text"
+            value={inputText}
+            onChange={(e) => {
+              setInputText(e.target.value);
+              triggerTyping();
+            }}
+            onKeyDown={handleKeyDown}
+            placeholder="Ketik pesan..."
+            className="flex-1 bg-slate-100 text-slate-800 placeholder-slate-400 px-4 py-2.5 rounded-2xl text-sm focus:outline-hidden focus:ring-2 focus:ring-emerald-500 focus:bg-white transition-all"
+          />
 
-            <button
-              type="submit"
-              disabled={!inputText.trim()}
-              className="p-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-30 disabled:hover:bg-emerald-600 text-white rounded-xl transition-all cursor-pointer shrink-0"
-              title="Kirim"
-            >
-              <Send className="w-4 h-4" />
-            </button>
-          </form>
-        )}
-      </div>
+          {/* Send button */}
+          <button
+            type="submit"
+            disabled={!inputText.trim()}
+            className="p-2.5 rounded-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:hover:bg-emerald-600 text-white transition-all cursor-pointer shrink-0 shadow-xs active:scale-95"
+            title="Kirim"
+          >
+            <Send className="w-5 h-5" />
+          </button>
+        </form>
+      </footer>
 
-      {/* Color picker modal (Pure color picker, no names) */}
+      {/* Audio Recorder overlay */}
+      {showRecorder && (
+        <AudioRecorder
+          onSendAudio={handleAudioComplete}
+          onCancel={() => setShowRecorder(false)}
+        />
+      )}
+
+      {/* Color Profile Selector Modal */}
       <IdentityModal
         isOpen={isColorModalOpen}
         onClose={() => setIsColorModalOpen(false)}
         currentAvatar={avatar}
         onSave={updateAvatar}
+      />
+
+      {/* Admin Panel Modal */}
+      <AdminModal
+        isOpen={isAdminModalOpen}
+        onClose={() => setIsAdminModalOpen(false)}
+        isAdmin={isAdmin}
+        onLoginSuccess={handleAdminLoginSuccess}
+        onLogout={handleAdminLogout}
+        activePeers={activePeers}
+        myUserId={userId}
+        messagesCount={messages.length}
+        onClearAllMessages={clearAllMessages}
       />
     </div>
   );

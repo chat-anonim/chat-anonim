@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import mqtt, { MqttClient } from 'mqtt';
-import { ChatMessage } from '../types';
+import { ChatMessage, PeerUser } from '../types';
 import { sound } from '../utils/sound';
+import { getDeviceInfo } from '../utils/device';
 
 const MQTT_TOPIC_ROOM = 'ghostchat/v1/global_room';
 const MQTT_TOPIC_PRESENCE = 'ghostchat/v1/presence';
@@ -38,7 +39,7 @@ export function useGhostSocket() {
   const isMountedRef = useRef<boolean>(true);
   const isClosingIntentionally = useRef<boolean>(false);
   const presenceIntervalRef = useRef<number | null>(null);
-  const activePeersRef = useRef<Map<string, number>>(new Map());
+  const activePeersMapRef = useRef<Map<string, PeerUser>>(new Map());
   const typingTimerRef = useRef<number | null>(null);
 
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
@@ -89,6 +90,7 @@ export function useGhostSocket() {
   avatarRef.current = avatar;
 
   const [onlineCount, setOnlineCount] = useState<number>(1);
+  const [activePeers, setActivePeers] = useState<PeerUser[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>(() => getLocalHistory());
   const [typingAvatars, setTypingAvatars] = useState<string[]>([]);
 
@@ -100,6 +102,23 @@ export function useGhostSocket() {
       saveLocalHistory(next);
       return next;
     });
+  }, []);
+
+  // Delete message locally
+  const removeMessageLocally = useCallback((messageId: string) => {
+    setMessages(prev => {
+      const next = prev.filter(m => m.id !== messageId);
+      saveLocalHistory(next);
+      return next;
+    });
+  }, []);
+
+  // Clear all messages locally
+  const clearMessagesLocally = useCallback(() => {
+    setMessages([]);
+    try {
+      localStorage.removeItem('ghost_chat_history');
+    } catch {}
   }, []);
 
   // Update message reaction
@@ -132,6 +151,7 @@ export function useGhostSocket() {
     setConnectionStatus('connecting');
 
     try {
+      const myDevice = getDeviceInfo();
       const brokerUrl = MQTT_BROKERS[0];
       const client = mqtt.connect(brokerUrl, {
         clientId: 'ghost_' + userIdRef.current + '_' + Math.random().toString(16).substring(2, 8),
@@ -150,7 +170,7 @@ export function useGhostSocket() {
           if (err) console.error('MQTT subscribe error:', err);
         });
 
-        // Send initial presence announcement
+        // Send initial presence announcement with device info
         const announcePresence = () => {
           if (client.connected) {
             client.publish(
@@ -159,6 +179,7 @@ export function useGhostSocket() {
                 userId: userIdRef.current,
                 alias: aliasRef.current,
                 avatar: avatarRef.current,
+                deviceInfo: myDevice,
                 timestamp: Date.now(),
               })
             );
@@ -173,13 +194,15 @@ export function useGhostSocket() {
 
           // Prune stale peers older than 25 seconds
           const now = Date.now();
-          activePeersRef.current.forEach((time, peerId) => {
-            if (now - time > 25000) {
-              activePeersRef.current.delete(peerId);
+          activePeersMapRef.current.forEach((peer, peerId) => {
+            if (now - peer.lastSeen > 25000) {
+              activePeersMapRef.current.delete(peerId);
             }
           });
-          setOnlineCount(Math.max(1, activePeersRef.current.size + 1));
-        }, 8000);
+          const peerList = Array.from(activePeersMapRef.current.values());
+          setActivePeers(peerList);
+          setOnlineCount(Math.max(1, peerList.length + 1));
+        }, 7000);
       });
 
       client.on('message', (topic, payload) => {
@@ -188,8 +211,16 @@ export function useGhostSocket() {
 
           if (topic === MQTT_TOPIC_PRESENCE) {
             if (data.userId && data.userId !== userIdRef.current) {
-              activePeersRef.current.set(data.userId, Date.now());
-              setOnlineCount(Math.max(1, activePeersRef.current.size + 1));
+              activePeersMapRef.current.set(data.userId, {
+                userId: data.userId,
+                alias: data.alias || 'Pengguna Lain',
+                avatar: data.avatar || '0',
+                deviceInfo: data.deviceInfo,
+                lastSeen: Date.now(),
+              });
+              const peerList = Array.from(activePeersMapRef.current.values());
+              setActivePeers(peerList);
+              setOnlineCount(Math.max(1, peerList.length + 1));
             }
             return;
           }
@@ -212,6 +243,10 @@ export function useGhostSocket() {
               }
             } else if (data.type === 'chat:reaction') {
               applyReaction(data.messageId, data.emoji, data.senderId);
+            } else if (data.type === 'chat:delete_message') {
+              removeMessageLocally(data.messageId);
+            } else if (data.type === 'chat:clear_all') {
+              clearMessagesLocally();
             }
           }
         } catch (err) {
@@ -232,7 +267,7 @@ export function useGhostSocket() {
       console.error('Failed to init MQTT:', err);
       setConnectionStatus('disconnected');
     }
-  }, [appendMessage, applyReaction]);
+  }, [appendMessage, applyReaction, removeMessageLocally, clearMessagesLocally]);
 
   // Connect via Node.js WebSocket (if local or custom backend is present)
   const connectNodeWs = useCallback(() => {
@@ -265,6 +300,13 @@ export function useGhostSocket() {
           return;
         }
         setConnectionStatus('connected');
+        // Send initial device info to ws server
+        try {
+          ws.send(JSON.stringify({
+            type: 'identity:device_info',
+            deviceInfo: getDeviceInfo(),
+          }));
+        } catch {}
       };
 
       ws.onmessage = (event) => {
@@ -286,8 +328,14 @@ export function useGhostSocket() {
                 }))
               );
             }
+            if (Array.isArray(data.peers)) {
+              setActivePeers(data.peers);
+            }
           } else if (data.type === 'server:online_count') {
             setOnlineCount(data.onlineCount);
+            if (Array.isArray(data.peers)) {
+              setActivePeers(data.peers);
+            }
           } else if (data.type === 'chat:new_message') {
             const msg: ChatMessage = data.message;
             const isSelf = msg.senderId === userIdRef.current;
@@ -304,30 +352,31 @@ export function useGhostSocket() {
             setMessages(prev =>
               prev.map(m => (m.id === data.messageId ? { ...m, reactions: data.reactions } : m))
             );
+          } else if (data.type === 'chat:delete_message') {
+            removeMessageLocally(data.messageId);
+          } else if (data.type === 'chat:clear_all') {
+            clearMessagesLocally();
           }
         } catch {}
       };
 
       ws.onclose = () => {
         if (!isMountedRef.current || isClosingIntentionally.current) return;
-        // If local websocket closes or is unavailable, seamlessly switch to Serverless MQTT
         connectServerlessMqtt();
       };
 
       ws.onerror = () => {
-        // Fallback to Serverless MQTT immediately
         connectServerlessMqtt();
       };
     } catch {
       connectServerlessMqtt();
     }
-  }, [appendMessage, connectServerlessMqtt]);
+  }, [appendMessage, connectServerlessMqtt, removeMessageLocally, clearMessagesLocally]);
 
   useEffect(() => {
     isMountedRef.current = true;
     isClosingIntentionally.current = false;
 
-    // If on GitHub Pages without a custom backend, directly use serverless MQTT for instantaneous connection
     const customUrl = (import.meta as any).env?.VITE_SERVER_URL;
     if (isGitHubPages() && !customUrl) {
       connectServerlessMqtt();
@@ -357,6 +406,8 @@ export function useGhostSocket() {
     if (!text.trim() && !options?.mediaUrl) return;
 
     sound.playMessageSent();
+    const myDevice = getDeviceInfo();
+
     const newMsg: ChatMessage = {
       id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
       senderId: userIdRef.current,
@@ -368,6 +419,7 @@ export function useGhostSocket() {
       duration: options?.duration,
       timestamp: Date.now(),
       reactions: {},
+      deviceInfo: myDevice,
     };
 
     // Show self immediately
@@ -382,6 +434,7 @@ export function useGhostSocket() {
           msgType: options?.msgType || 'text',
           mediaUrl: options?.mediaUrl,
           duration: options?.duration,
+          deviceInfo: myDevice,
         })
       );
       return;
@@ -398,6 +451,58 @@ export function useGhostSocket() {
       );
     }
   }, [appendMessage]);
+
+  // Admin action: Delete message
+  const deleteMessage = useCallback((messageId: string) => {
+    sound.playClick();
+    removeMessageLocally(messageId);
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'chat:delete_message',
+          messageId,
+          adminKey: 'Farabi24',
+        })
+      );
+    }
+
+    if (mqttClientRef.current && mqttClientRef.current.connected) {
+      mqttClientRef.current.publish(
+        MQTT_TOPIC_ROOM,
+        JSON.stringify({
+          type: 'chat:delete_message',
+          messageId,
+          adminKey: 'Farabi24',
+        })
+      );
+    }
+  }, [removeMessageLocally]);
+
+  // Admin action: Clear all messages
+  const clearAllMessages = useCallback(() => {
+    sound.playClick();
+    clearMessagesLocally();
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'chat:clear_all',
+          adminKey: 'Farabi24',
+        })
+      );
+    }
+
+    if (mqttClientRef.current && mqttClientRef.current.connected) {
+      mqttClientRef.current.publish(
+        MQTT_TOPIC_ROOM,
+        JSON.stringify({
+          type: 'chat:clear_all',
+          adminKey: 'Farabi24',
+        })
+      );
+    }
+  }, [clearMessagesLocally]);
 
   // Update avatar
   const updateAvatar = useCallback((newAvatar: string) => {
@@ -483,10 +588,13 @@ export function useGhostSocket() {
     alias,
     avatar,
     onlineCount,
+    activePeers,
     messages,
     typingAvatars,
     updateAvatar,
     sendMessage,
+    deleteMessage,
+    clearAllMessages,
     triggerTyping,
     sendReaction,
   };
