@@ -157,7 +157,8 @@ export default function App() {
   };
 
   const handleCopyLink = () => {
-    navigator.clipboard.writeText(window.location.href);
+    const shareUrl = 'https://chat-anonim.github.io/chat-anonim/';
+    navigator.clipboard.writeText(shareUrl);
     setCopiedLink(true);
     setTimeout(() => setCopiedLink(false), 2000);
   };
@@ -363,14 +364,10 @@ export default function App() {
                     {formatTimestamp(msg.timestamp)}
                   </span>
 
-                  {/* Device Used Badge */}
-                  {msg.deviceInfo && (
+                  {/* Device Used Badge - HANYA DILIHAT OLEH ADMIN */}
+                  {isAdmin && msg.deviceInfo && (
                     <span
-                      className={`text-[10px] flex items-center gap-1 font-mono px-1.5 py-0.2 rounded-md ${
-                        isAdmin
-                          ? 'bg-amber-50 text-amber-800 border border-amber-200'
-                          : 'bg-slate-100 text-slate-500'
-                      }`}
+                      className="text-[10px] flex items-center gap-1 font-mono px-1.5 py-0.2 rounded-md bg-amber-50 text-amber-800 border border-amber-200"
                       title={`Dikirim dari: ${msg.deviceInfo.full}`}
                     >
                       {msg.deviceInfo.isMobile ? (
