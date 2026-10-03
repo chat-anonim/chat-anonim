@@ -2,6 +2,38 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { ChatMessage } from '../types';
 import { sound } from '../utils/sound';
 
+function getWsEndpoint(userId: string): string {
+  const envUrl = (import.meta as any).env?.VITE_SERVER_URL || (import.meta as any).env?.VITE_WS_URL;
+  const custom = typeof window !== 'undefined' ? localStorage.getItem('anon_chat_server') : null;
+  const target = custom || envUrl;
+
+  if (target) {
+    try {
+      const url = new URL(target.startsWith('http') || target.startsWith('ws') ? target : `https://${target}`);
+      const proto = url.protocol === 'https:' || url.protocol === 'wss:' ? 'wss:' : 'ws:';
+      const q = userId ? `?userId=${encodeURIComponent(userId)}` : '';
+      return `${proto}//${url.host}/ws${q}`;
+    } catch {}
+  }
+
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const query = userId ? `?userId=${encodeURIComponent(userId)}` : '';
+  return `${protocol}//${window.location.host}/ws${query}`;
+}
+
+function getHttpApiBase(): string {
+  const envUrl = (import.meta as any).env?.VITE_SERVER_URL;
+  const custom = typeof window !== 'undefined' ? localStorage.getItem('anon_chat_server') : null;
+  const target = custom || envUrl;
+  if (target) {
+    try {
+      const url = new URL(target.startsWith('http') ? target : `https://${target}`);
+      return `${url.protocol}//${url.host}`;
+    } catch {}
+  }
+  return '';
+}
+
 export function useGhostSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
@@ -10,15 +42,20 @@ export function useGhostSocket() {
   const typingTimerRef = useRef<number | null>(null);
   const isMountedRef = useRef<boolean>(true);
   const isClosingIntentionally = useRef<boolean>(false);
+  const localChannelRef = useRef<BroadcastChannel | null>(null);
 
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
   
   // Persist session userId in sessionStorage so page reload re-uses the exact same identity
   const [userId, setUserId] = useState<string>(() => {
     try {
-      return sessionStorage.getItem('anon_chat_uid') || '';
+      const saved = sessionStorage.getItem('anon_chat_uid');
+      if (saved) return saved;
+      const newId = 'anon_' + Math.random().toString(36).substring(2, 9);
+      sessionStorage.setItem('anon_chat_uid', newId);
+      return newId;
     } catch {
-      return '';
+      return 'anon_' + Math.random().toString(36).substring(2, 9);
     }
   });
   const userIdRef = useRef<string>(userId);
@@ -38,7 +75,7 @@ export function useGhostSocket() {
 
   const isHttpFallback = useRef<boolean>(false);
 
-  // Dispatch events from WebSocket or HTTP polling
+  // Dispatch events from WebSocket, HTTP polling, or local BroadcastChannel
   const handleServerEvent = useCallback((data: any) => {
     switch (data.type) {
       case 'connection:init':
@@ -116,13 +153,35 @@ export function useGhostSocket() {
     }
   }, []);
 
+  // Cross-tab broadcast for static deployments or offline sync
+  useEffect(() => {
+    try {
+      if ('BroadcastChannel' in window) {
+        const bc = new BroadcastChannel('anon_chat_mesh');
+        localChannelRef.current = bc;
+        bc.onmessage = (event) => {
+          if (event.data) {
+            handleServerEvent(event.data);
+          }
+        };
+      }
+    } catch {}
+    return () => {
+      try {
+        localChannelRef.current?.close();
+      } catch {}
+    };
+  }, [handleServerEvent]);
+
   // HTTP polling fallback if needed
   const startHttpFallback = useCallback(async () => {
     if (isHttpFallback.current) return;
     isHttpFallback.current = true;
 
+    const apiBase = getHttpApiBase();
+
     try {
-      const initRes = await fetch('/api/init', {
+      const initRes = await fetch(`${apiBase}/api/init`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: userIdRef.current || undefined }),
@@ -143,7 +202,7 @@ export function useGhostSocket() {
       if (!userIdRef.current) return;
 
       try {
-        const res = await fetch(`/api/poll?userId=${encodeURIComponent(userIdRef.current)}`);
+        const res = await fetch(`${apiBase}/api/poll?userId=${encodeURIComponent(userIdRef.current)}`);
         if (res.ok) {
           const pollData = await res.json();
           if (Array.isArray(pollData.events)) {
@@ -165,9 +224,7 @@ export function useGhostSocket() {
     }
 
     setConnectionStatus('connecting');
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const query = userIdRef.current ? `?userId=${encodeURIComponent(userIdRef.current)}` : '';
-    const wsUrl = `${protocol}//${window.location.host}/ws${query}`;
+    const wsUrl = getWsEndpoint(userIdRef.current);
 
     try {
       isClosingIntentionally.current = false;
@@ -243,14 +300,20 @@ export function useGhostSocket() {
     };
   }, [connect]);
 
-  // Send action via WebSocket or HTTP fallback
+  // Send action via WebSocket, HTTP fallback, or local broadcast
   const sendAction = useCallback((data: any) => {
+    // If local channel exists, broadcast to local tabs
+    try {
+      localChannelRef.current?.postMessage(data);
+    } catch {}
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(data));
       return;
     }
-    if (userIdRef.current) {
-      fetch('/api/action', {
+    const apiBase = getHttpApiBase();
+    if (userIdRef.current && apiBase) {
+      fetch(`${apiBase}/api/action`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -283,6 +346,24 @@ export function useGhostSocket() {
     if (!text.trim() && !options?.mediaUrl) return;
 
     sound.playMessageSent();
+    const newMsg: ChatMessage = {
+      id: 'msg_' + Math.random().toString(36).substring(2, 9),
+      senderId: userIdRef.current,
+      senderAlias: alias || 'Anonim',
+      senderAvatar: avatar,
+      text: text.trim(),
+      msgType: options?.msgType || 'text',
+      mediaUrl: options?.mediaUrl,
+      duration: options?.duration,
+      timestamp: Date.now(),
+      reactions: {},
+    };
+
+    // If offline/disconnected, show message immediately on self
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      setMessages(prev => [...prev, { ...newMsg, isSelf: true }]);
+    }
+
     sendAction({
       type: 'chat:message',
       text: text.trim(),
@@ -290,7 +371,7 @@ export function useGhostSocket() {
       mediaUrl: options?.mediaUrl,
       duration: options?.duration,
     });
-  }, [sendAction]);
+  }, [sendAction, alias, avatar]);
 
   const sendTyping = useCallback((isTyping: boolean) => {
     sendAction({

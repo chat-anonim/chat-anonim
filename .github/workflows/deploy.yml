@@ -1,18 +1,29 @@
-name: Build & Deploy Chat App
+name: Deploy ke GitHub Pages
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
+
+# Hak akses yang diperlukan untuk mempublikasikan web ke GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Menghindari penumpukan deploy bersamaan
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build & Test
+  build-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js
@@ -24,26 +35,26 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
-      - name: Verify TypeScript & Build Frontend
-        run: |
-          npm run lint
-          npm run build
+      - name: Build Web Application
+        run: npm run build
 
-  deploy:
-    name: Deploy to Cloud (Render / Web Service)
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
 
-    steps:
-      - name: Trigger Deploy Hook (Optional)
-        # Jika kamu menambahkan secret RENDER_DEPLOY_HOOK di repository GitHub (Settings > Secrets and variables > Actions),
-        # GitHub Action ini akan otomatis men-deploy aplikasi secara otomatis setiap ada push baru!
+      - name: Upload Artifact Hasil Build (dist)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './dist'
+
+      - name: Deploy ke GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Trigger Cloud Server Deploy (Opsional)
+        # Jika kamu juga memasang backend di Render dan mengisi RENDER_DEPLOY_HOOK di GitHub Secrets
+        if: env.RENDER_HOOK != ''
+        env:
+          RENDER_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
         run: |
-          if [ -n "${{ secrets.RENDER_DEPLOY_HOOK }}" ]; then
-            echo "Memanggil deploy hook..."
-            curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
-            echo "Deploy hook berhasil dikirim!"
-          else
-            echo "RENDER_DEPLOY_HOOK tidak diatur, melewati webhook deploy. (Jika menggunakan Render auto-deploy, Render akan deploy langsung dari GitHub)"
-          fi
+          curl -X POST "$RENDER_HOOK"
+          echo "Deploy hook server berhasil dikirim!"
